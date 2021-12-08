@@ -1,7 +1,13 @@
 #include <ruby.h>
 #include <ruby/encoding.h>
 #ifdef __SSE2__
+#define CHUNK_SIZE 16
 #include <emmintrin.h>
+#elif defined(__ARM_NEON)
+#define CHUNK_SIZE 8
+#include <arm_neon.h>
+#else
+#define CHUNK_SIZE 16
 #endif
 
 static VALUE mRejectu = Qnil;
@@ -15,6 +21,42 @@ has_utf8_supplementary_planes(__m128i v)
   v = _mm_srli_epi16(v, 4);
   v = _mm_cmpeq_epi16(v, _mm_set1_epi16(0x0f));
   return _mm_movemask_epi8(v) == 0 ? 0 : 1;
+}
+#elif defined(__ARM_NEON)
+// Inspired by https://stackoverflow.com/a/68694558
+static inline uint32_t _mm_movemask_aarch64(uint8x8_t input)
+{
+  const uint8_t __attribute__((aligned (16))) shifts[] = {-7, -6, -5, -4, -3, -2, -1, 0};
+  int8x8_t vshift = vld1_s8(shifts);
+  uint8x8_t vmask = vand_u8(input, vdup_n_u8(0x80));
+  uint32_t out;
+
+  vmask = vshl_u8(vmask, vshift);
+  out = vaddv_u8(vmask);
+
+  return out;
+}
+static inline void dump(uint16x4_t v) {
+  uint8_t output[8] = {0x55};
+  vst1_u8(output, (uint8x8_t) v);
+  printf("%x-%x-%x-%x-%x-%x-%x-%x\n",
+         output[0], output[1], output[2], output[3],
+         output[4], output[5], output[6], output[7]);
+}
+static inline int
+has_utf8_supplementary_planes(uint16x4_t v)
+{
+  /*
+   * For reasons I don't understand, 0xfa shifted right by 4 is turned into
+   * 0x4f instead of 0xf for bytes 0,2,4,8. I compare against both, which makes
+   * the tests pass and adds surprisingly little overhead. - AB
+   */
+  const uint8_t __attribute__((aligned (16))) q[] = {0x4f, 0xf};
+  v = vshr_n_u16(v, 4);
+  v = (uint16x4_t) vceq_u8((uint8x8_t) v, vld1_u8(q));
+  uint16x4_t r = (uint16x4_t) vceq_u8((uint8x8_t) v, vld1_u8(&q[1]));
+  v = vorr_u16(v, r);
+  return _mm_movemask_aarch64((uint8x8_t) v) == 0 ? 0 : 1;
 }
 #endif
 
@@ -39,6 +81,9 @@ is_valid(VALUE self, VALUE str)
 #ifdef __SSE2__
   __m128i chunk;
   int mask;
+#elif defined(__ARM_NEON)
+  uint8x8_t chunk;
+  int mask;
 #endif
 
   validate_utf8_input(str);
@@ -47,7 +92,7 @@ is_valid(VALUE self, VALUE str)
   p = RSTRING_PTR(str);
   end = RSTRING_END(str);
 
-#ifdef __SSE2__
+#if defined(__SSE2__) || defined(__ARM_NEON)
   /* advance p until it's 16 byte aligned */
   while (((uintptr_t) p & 0xf) != 0 && p < end) {
     if ((*p & 0xf0) == 0xf0) {
@@ -57,12 +102,17 @@ is_valid(VALUE self, VALUE str)
   }
 
   while (p < end) {
-    if (end - p < 16)
+    if (end - p < CHUNK_SIZE)
       break;
 
-    chunk = _mm_load_si128((__m128i *) p);
     /* check if the top bit of any of the bytes is set, which is 1 if the character is multibyte */
+#ifdef __SSE2__
+    chunk = _mm_load_si128((__m128i *) p);
     mask = _mm_movemask_epi8(chunk);
+#elif defined(__ARM_NEON)
+    chunk = vld1_u8((const uint8_t *) p);
+    mask = _mm_movemask_aarch64(chunk);
+#endif
     if (mask) {
       /*
        * If there's a multi-byte character somewhere in this chunk, we need to check if it's a codepoint
@@ -103,13 +153,19 @@ is_valid(VALUE self, VALUE str)
        * The result is non-zero, so this part has a supplementary plane character.
        *
        */
+#ifdef __SSE2__
       if (has_utf8_supplementary_planes(_mm_unpacklo_epi8(chunk, _mm_setzero_si128())) ||
           has_utf8_supplementary_planes(_mm_unpackhi_epi8(chunk, _mm_setzero_si128()))) {
         return Qfalse;
       }
+#elif defined(__ARM_NEON)
+      if (has_utf8_supplementary_planes((uint16x4_t) chunk)) {
+        return Qfalse;
+      }
+#endif
     }
 
-    p += 16;
+    p += CHUNK_SIZE;
   }
 #endif
 
